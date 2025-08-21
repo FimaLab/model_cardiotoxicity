@@ -1,0 +1,9 @@
+[theme]
+# Основные цвета
+primaryColor = "#1e88e5"         # Ярко-синий
+backgroundColor =  "#ffffff"    # Белый для карточек и панелей
+secondaryBackgroundColor = "#c2e5f0"  # Светло-серый фон
+textColor = "#000000"            # Тёмно-серый для текста
+
+# Шрифт
+font = "sans serif"
