@@ -18,9 +18,10 @@ st.markdown("""
 2) считает средние по *(Drug, Group, Concentration)*,  
 3) считает отношения **test/control_neg**,  
 4) считает **AUC по дозам методом трапеций** (wide-таблица),  
-5) показывает AUC-таблицу с колонкой «Кардиотоксичность»,  
-6) считает **|Z|-score AUC** отдельно для кардио/некардио и фильтрует **метаболиты** по порогам (|Z| ≥ 1, 1.5, 2, 3),  
-7) графики «доза–отношение» (в expander).
+5) показывает AUC-таблицу с колонкой «Кардиотоксичность» (в начале),  
+6) считает **|Z|-score AUC** отдельно для кардио/некардио (полные таблицы),  
+7) ниже — выбор порога и блок **«Значимые метаболиты»** по |Z|,  
+8) графики «доза–отношение» (в expander).
 """)
 
 uploaded = st.file_uploader("Загрузить Excel-файл", type=["xlsx", "xls"])
@@ -51,7 +52,6 @@ def compute_group_means(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     for c in metabolite_cols:
         df_numeric[c] = pd.to_numeric(df_numeric[c], errors="coerce")
 
-    # сохраняем порядок появления ключей (sort=False), без дополнительной сортировки
     grouped = (
         df_numeric
         .groupby(["Drug", "Group", "Concentration"], dropna=False, sort=False)[metabolite_cols]
@@ -98,7 +98,7 @@ def compute_auc_wide(df_ratio: pd.DataFrame, meta_cols: List[str]) -> pd.DataFra
     for drug, sub in df_ratio.groupby("Drug", sort=False):
         x = sub["Concentration"].to_numpy(dtype=float)
         auc_row = {"Drug": drug}
-        for m in meta_cols:  # исходный порядок метаболитов
+        for m in meta_cols:
             y = sub[m].to_numpy(dtype=float)
             auc_row[m] = trapz_auc(x, y)
         rows.append(auc_row)
@@ -106,10 +106,7 @@ def compute_auc_wide(df_ratio: pd.DataFrame, meta_cols: List[str]) -> pd.DataFra
     return auc_wide[["Drug"] + meta_cols]
 
 def zscore_by_group_abs(auc_wide_labeled: pd.DataFrame, meta_cols: List[str], group_flag: bool) -> pd.DataFrame:
-    """
-    |Z|-score AUC для указанной группы (Cardiotoxic=True/False).
-    Z = |(x - mean_group)/std_group|, ddof=1. Порядок колонок сохраняется как в meta_cols.
-    """
+    """|Z|-score AUC для указанной группы (Cardiotoxic=True/False)."""
     df = auc_wide_labeled[auc_wide_labeled["Cardiotoxic"] == group_flag].copy()
     if df.empty:
         return pd.DataFrame(columns=["Drug"] + meta_cols)
@@ -117,26 +114,13 @@ def zscore_by_group_abs(auc_wide_labeled: pd.DataFrame, meta_cols: List[str], gr
     out = pd.concat([df[["Drug"]].reset_index(drop=True), Z.reset_index(drop=True)], axis=1)
     return out[["Drug"] + meta_cols]
 
-def filter_metabolites_by_threshold(df_zabs: pd.DataFrame, meta_cols: List[str], threshold: float) -> pd.DataFrame:
-    """
-    Оставляет только те метаболиты (колонки), у которых хотя бы у одного препарата |Z| >= threshold.
-    Строки (Drug) не фильтруем.
-    """
-    if df_zabs.empty:
-        return df_zabs
-    keep = ["Drug"] + [m for m in meta_cols if (df_zabs[m] >= threshold).any(skipna=True)]
-    # если ни один метаболит не прошёл порог — оставим только Drug
-    if keep == ["Drug"]:
-        return df_zabs[["Drug"]]
-    return df_zabs[keep]
-
-def melt_hits(df_zabs: pd.DataFrame, meta_cols: List[str], threshold: float) -> pd.DataFrame:
-    """Long-вид хитов: Drug, Metabolite, |Z| для значений >= threshold."""
+def melt_significant(df_zabs: pd.DataFrame, meta_cols: List[str], threshold: float) -> pd.DataFrame:
+    """Long-таблица «Значимые метаболиты»: Drug, Metabolite, |Z| для значений >= threshold."""
     if df_zabs.empty or threshold <= 0:
         return pd.DataFrame(columns=["Drug", "Metabolite", "|Z|"])
     long = df_zabs.melt(id_vars=["Drug"], value_vars=meta_cols, var_name="Metabolite", value_name="|Z|")
-    hits = long[np.isfinite(long["|Z|"]) & (long["|Z|"] >= threshold)]
-    return hits
+    sig = long[np.isfinite(long["|Z|"]) & (long["|Z|"] >= threshold)]
+    return sig
 
 def to_excel_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
     buffer = io.BytesIO()
@@ -177,6 +161,10 @@ if uploaded is not None:
             df_auc_marked = df_auc_wide.copy()
             df_auc_marked["Cardiotoxic"] = df_auc_marked["Drug"].map(st.session_state.cardiotox_map).fillna(False)
 
+            # перемещаем колонку Cardiotoxic в начало
+            cols = ["Cardiotoxic", "Drug"] + meta_cols
+            df_auc_marked = df_auc_marked[cols]
+
             edited_auc = st.data_editor(
                 df_auc_marked,
                 use_container_width=True,
@@ -189,7 +177,7 @@ if uploaded is not None:
                         default=False,
                     ),
                 },
-                disabled=[c for c in df_auc_marked.columns if c not in ["Drug", "Cardiotoxic"]],
+                disabled=meta_cols,
             )
 
             # обновить state из редактора
@@ -209,64 +197,56 @@ if uploaded is not None:
                 st.markdown("**Без кардиотоксичности:**")
                 st.markdown("\n".join(f"- {d}" for d in nontoxic_list) if nontoxic_list else "_все отмечены как кардиотоксичные_")
 
-            # --- |Z|-SCORE AUC ПО ГРУППАМ + ФИЛЬТР МЕТАБОЛИТОВ ---
-            st.subheader("|Z|-score AUC по группам и пороги (фильтруем метаболиты)")
+            # --- |Z|-SCORE AUC ПО ГРУППАМ (ПОЛНЫЕ ТАБЛИЦЫ, БЕЗ ФИЛЬТРА) ---
+            st.subheader("|Z|-score AUC по группам (полные таблицы)")
             auc_labeled = edited_auc.copy()
 
-            zabs_toxic = zscore_by_group_abs(auc_labeled, meta_cols, group_flag=True)
-            zabs_nontoxic = zscore_by_group_abs(auc_labeled, meta_cols, group_flag=False)
+            zabs_toxic_full = zscore_by_group_abs(auc_labeled, meta_cols, group_flag=True)
+            zabs_nontoxic_full = zscore_by_group_abs(auc_labeled, meta_cols, group_flag=False)
 
-            # селектор порога (всегда используем >= threshold)
+            czt_full, czn_full = st.columns(2)
+            with czt_full:
+                st.markdown("**Кардиотоксичные — |Z|-score (полная таблица)**")
+                st.dataframe(zabs_toxic_full, use_container_width=True)
+            with czn_full:
+                st.markdown("**Без кардиотоксичности — |Z|-score (полная таблица)**")
+                st.dataframe(zabs_nontoxic_full, use_container_width=True)
+
+            # --- ПОРОГ И «ЗНАЧИМЫЕ МЕТАБОЛИТЫ» (ФИЛЬТР ПРИМЕНЯЕТСЯ ТОЛЬКО ЗДЕСЬ) ---
+            st.subheader("Значимые метаболиты (Drug, Metabolite, |Z| ≥ порога)")
             th_label = st.selectbox(
-                "Порог по |Z| (метаболит включается, если у какого-либо препарата |Z| ≥ порога)",
-                ["Показать все", "|Z| ≥ 1.0", "|Z| ≥ 1.5", "|Z| ≥ 2.0", "|Z| ≥ 3.0"],
+                "Порог по |Z| (включается, если у какого-либо препарата |Z| ≥ порога)",
+                ["|Z| ≥ 1.0", "|Z| ≥ 1.5", "|Z| ≥ 2.0", "|Z| ≥ 3.0"],
                 index=0
             )
-            if th_label == "Показать все":
-                threshold = 0.0
-            else:
-                threshold = float(th_label.split("≥")[1].strip())
+            threshold = float(th_label.split("≥")[1].strip())
 
-            # отфильтруем МЕТАБОЛИТЫ (колонки), а не препараты (строки)
-            zabs_toxic_f = filter_metabolites_by_threshold(zabs_toxic, meta_cols, threshold) if threshold > 0 else zabs_toxic
-            zabs_nontoxic_f = filter_metabolites_by_threshold(zabs_nontoxic, meta_cols, threshold) if threshold > 0 else zabs_nontoxic
+            sig_toxic = melt_significant(zabs_toxic_full, meta_cols, threshold)
+            sig_nontoxic = melt_significant(zabs_nontoxic_full, meta_cols, threshold)
 
-            czt, czn = st.columns(2)
-            with czt:
-                st.markdown("**Кардиотоксичные — |Z|-score**")
-                st.dataframe(zabs_toxic_f, use_container_width=True)
-            with czn:
-                st.markdown("**Без кардиотоксичности — |Z|-score**")
-                st.dataframe(zabs_nontoxic_f, use_container_width=True)
-
-            # хиты (long) по выбранному порогу (полезно для экспорта/анализа)
-            st.markdown("### Хиты (Drug, Metabolite, |Z|) по выбранному порогу")
-            hits_toxic = melt_hits(zabs_toxic, meta_cols, threshold)
-            hits_nontoxic = melt_hits(zabs_nontoxic, meta_cols, threshold)
-
-            cht, chn = st.columns(2)
-            with cht:
-                st.markdown(f"**Кардиотоксичные — хиты ({th_label})**")
-                st.dataframe(hits_toxic, use_container_width=True)
-            with chn:
-                st.markdown(f"**Без кардиотоксичности — хиты ({th_label})**")
-                st.dataframe(hits_nontoxic, use_container_width=True)
+            c_sig_t, c_sig_n = st.columns(2)
+            with c_sig_t:
+                st.markdown(f"**Кардиотоксичные — значимые метаболиты ({th_label})**")
+                st.dataframe(sig_toxic, use_container_width=True)
+            with c_sig_n:
+                st.markdown(f"**Без кардиотоксичности — значимые метаболиты ({th_label})**")
+                st.dataframe(sig_nontoxic, use_container_width=True)
 
             # --- Кнопки скачивания ---
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.download_button(
-                    label="Скачать AUC (с разметкой) — Excel",
+                    label="Скачать AUC (с разметкой)",
                     data=to_excel_bytes(auc_labeled, sheet_name="AUC_Wide_Labeled"),
                     file_name="auc_wide_with_labels.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
             with col2:
-                # выгрузка |Z|-таблиц (полных) двумя листами
+                # выгрузка полных |Z|-таблиц
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-                    zabs_toxic.to_excel(writer, index=False, sheet_name="Zabs_Toxic")
-                    zabs_nontoxic.to_excel(writer, index=False, sheet_name="Zabs_NonToxic")
+                    zabs_toxic_full.to_excel(writer, index=False, sheet_name="Zabs_Toxic_Full")
+                    zabs_nontoxic_full.to_excel(writer, index=False, sheet_name="Zabs_NonToxic_Full")
                 buffer.seek(0)
                 st.download_button(
                     label="Скачать |Z|-таблицы (полные)",
@@ -275,34 +255,27 @@ if uploaded is not None:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
             with col3:
-                # выгрузка отфильтрованных по метаболитам таблиц
+                # выгрузка значимых метаболитов
                 buffer2 = io.BytesIO()
                 with pd.ExcelWriter(buffer2, engine="openpyxl") as writer:
-                    zabs_toxic_f.to_excel(writer, index=False, sheet_name="Zabs_Toxic_Filtered")
-                    zabs_nontoxic_f.to_excel(writer, index=False, sheet_name="Zabs_NonToxic_Filtered")
-                    hits_toxic.to_excel(writer, index=False, sheet_name="Hits_Toxic")
-                    hits_nontoxic.to_excel(writer, index=False, sheet_name="Hits_NonToxic")
+                    sig_toxic.to_excel(writer, index=False, sheet_name="Significant_Toxic")
+                    sig_nontoxic.to_excel(writer, index=False, sheet_name="Significant_NonToxic")
                 buffer2.seek(0)
                 st.download_button(
-                    label=f"Скачать отфильтрованные |Z| (порог {th_label})",
+                    label=f"Скачать значимые метаболиты ({th_label})",
                     data=buffer2.read(),
-                    file_name="zabs_filtered_and_hits.xlsx",
+                    file_name="significant_metabolites.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 
-            # --- Графики в expander ---
+            # --- Графики ---
             with st.expander("Графики доза–отношение", expanded=False):
                 c1, c2 = st.columns([1, 2])
                 with c1:
                     selected_metabolite = st.selectbox("Метаболит", meta_cols)
                 with c2:
-                    # порядок препаратов — как встречаются в данных
                     drugs_all = list(pd.unique(df_ratio["Drug"].dropna()))
-                    selected_drugs = st.multiselect(
-                        "Препараты (Drug)",
-                        options=drugs_all,
-                        default=drugs_all
-                    )
+                    selected_drugs = st.multiselect("Препараты", options=drugs_all, default=drugs_all)
 
                 plot_df = df_ratio[df_ratio["Drug"].isin(selected_drugs)] if selected_drugs else df_ratio.iloc[0:0]
 
