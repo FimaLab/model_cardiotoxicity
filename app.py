@@ -291,60 +291,91 @@ if uploaded is not None:
 
         # --- Графики (в expander, matplotlib) ---
         with st.expander("Графики доза–отношение (matplotlib)", expanded=False):
-            # Глобальные опции графиков
+            # Главная настройка графиков
             fill_area = st.checkbox("Закрашивать площадь (AUC)", value=True)
 
-            # Фильтры по кардиотоксичности для графиков (если есть хоть один токсичный)
+            # ==== 1) ГЛАВЕНСТВУЮЩИЙ фильтр по |Z| (стоит выше остальных виджетов) ====
+            filter_by_z = False
+            sig_graph = pd.DataFrame(columns=["Drug", "Metabolite", "|Z|"])
+            if can_compute_z and z_all is not None:
+                filter_by_z = st.checkbox(
+                    "Фильтровать по порогу |Z| (распространяется на выбор метаболитов и препаратов)",
+                    value=False
+                )
+                if filter_by_z:
+                    sig_graph = melt_significant(z_all, meta_cols, threshold_global)
+
+            # ==== 2) Список метаболитов с учётом главного фильтра ====
+            if filter_by_z:
+                # только значимые метаболиты под глобальный порог
+                sig_metas = set(sig_graph["Metabolite"].unique().tolist())
+                meta_options = [m for m in meta_cols if m in sig_metas]
+                if not meta_options:
+                    st.info(f"По порогу {th_label_global} не найдено значимых метаболитов для отображения.")
+                    st.stop()
+            else:
+                meta_options = meta_cols
+
+            # выбор метаболита
+            selected_metabolite = st.selectbox("Метаболит для графиков", meta_options, index=0)
+
+            # ==== 3) Базовый список препаратов ====
+            drugs_all = list(pd.unique(df_ratio["Drug"].dropna()))
+
+            # если включён главный фильтр, то ограничиваем препараты только теми, где выбранный метаболит значим
+            if filter_by_z:
+                drugs_allowed_for_meta = set(
+                    sig_graph.loc[sig_graph["Metabolite"] == selected_metabolite, "Drug"].unique().tolist()
+                )
+                drugs_all = [d for d in drugs_all if d in drugs_allowed_for_meta]
+                if not drugs_all:
+                    st.info(f"По порогу {th_label_global} и выбранному метаболиту "
+                            f"«{selected_metabolite}» нет подходящих препаратов.")
+                    st.stop()
+
+            # ==== 4) Фильтр «Показывать препараты» ниже по приоритету ====
+            tox_list = [d for d, v in st.session_state.cardiotox_map.items() if v]
+            non_list = [d for d, v in st.session_state.cardiotox_map.items() if not v]
             show_group_filter = len(tox_list) > 0 or len(non_list) > 0
             group_choice = "Все"
             if show_group_filter:
-                group_choice = st.selectbox("Показывать препараты", ["Все", "Только кардиотоксичные", "Только некардиотоксичные"], index=0)
+                group_choice = st.selectbox(
+                    "Показывать препараты",
+                    ["Все", "Только кардиотоксичные", "Только некардиотоксичные"],
+                    index=0
+                )
+                tox_map = st.session_state.cardiotox_map
+                if group_choice == "Только кардиотоксичные":
+                    drugs_all = [d for d in drugs_all if tox_map.get(d, False)]
+                elif group_choice == "Только некардиотоксичные":
+                    drugs_all = [d for d in drugs_all if not tox_map.get(d, False)]
 
-            # ---- ГЛАВЕНСТВУЮЩАЯ фильтрация по порогу |Z| ----
-            meta_options = meta_cols
-            drugs_allowed_by_z = None  # None = без ограничений по порогу
-            if can_compute_z and z_all is not None:
-                filter_metas_by_z = st.checkbox("Фильтровать метаболиты и препараты по порогу |Z| (для графиков)", value=False)
-                if filter_metas_by_z:
-                    sig_graph = melt_significant(z_all, meta_cols, threshold_global)
-                    significant_metas_set = set(sig_graph["Metabolite"].unique().tolist())
-                    drugs_allowed_by_z = set(sig_graph["Drug"].unique().tolist())
-
-                    meta_options = [m for m in meta_cols if m in significant_metas_set]
-
-                    if not meta_options or not drugs_allowed_by_z:
-                        st.info(f"По порогу {th_label_global} не найдено совпадений для графиков.")
-                        st.stop()
-
-            c1, c2 = st.columns([1, 2])
-            with c1:
-                selected_metabolite = st.selectbox("Метаболит для графиков", meta_options, index=0)
-            with c2:
-                drugs_all = list(pd.unique(df_ratio["Drug"].dropna()))
-
-                if isinstance(drugs_allowed_by_z, set):
-                    drugs_all = [d for d in drugs_all if d in drugs_allowed_by_z]
-
-                if group_choice != "Все":
-                    tox_map = st.session_state.cardiotox_map
-                    if group_choice == "Только кардиотоксичные":
-                        drugs_all = [d for d in drugs_all if tox_map.get(d, False)]
-                    elif group_choice == "Только некардиотоксичные":
-                        drugs_all = [d for d in drugs_all if not tox_map.get(d, False)]
-
-                if not drugs_all:
-                    st.info("По выбранным фильтрам (включая порог |Z|) не найдено совпадений для графиков.")
-                    st.stop()
-
-                selected_drugs = st.multiselect("Препараты", options=drugs_all, default=drugs_all)
-
-            plot_df = df_ratio[df_ratio["Drug"].isin(selected_drugs)] if selected_drugs else df_ratio.iloc[0:0]
-
-            if plot_df.empty:
-                st.info("По выбранным фильтрам (включая порог |Z|) не найдено совпадений для графиков.")
+            if not drugs_all:
+                st.info("По выбранным фильтрам не найдено подходящих препаратов для построения графиков.")
                 st.stop()
 
-            # Рисуем по одному графику на препарат (matplotlib)
+            # выбор препаратов после всех ограничений
+            selected_drugs = st.multiselect("Препараты", options=drugs_all, default=drugs_all)
+
+            # ==== 5) Данные для графиков ====
+            plot_df = df_ratio[df_ratio["Drug"].isin(selected_drugs)] if selected_drugs else df_ratio.iloc[0:0]
+
+            # если включён главный фильтр по Z — дополнительно отсекаем пары (Drug, Metabolite), которые не значимы
+            if filter_by_z and not plot_df.empty:
+                allowed_pairs = set(
+                    tuple(x) for x in sig_graph[["Drug", "Metabolite"]].itertuples(index=False, name=None)
+                )
+                # оставляем только строки для выбранного метаболита и тех Drug, где пара значима
+                plot_df = plot_df[
+                    (plot_df["Drug"].isin(drugs_all)) &
+                    (plot_df["Drug"].map(lambda d: (d, selected_metabolite) in allowed_pairs))
+                ]
+
+            if plot_df.empty:
+                st.info("По выбранным настройкам (включая порог |Z| и выбранный метаболит) совпадений не найдено.")
+                st.stop()
+
+            # ==== 6) Отрисовка: слева настройки, справа график ====
             for drug, sub in plot_df.groupby("Drug", sort=False):
                 sub_sorted = sub.sort_values("Concentration")
                 x = sub_sorted["Concentration"].to_numpy(dtype=float)
@@ -352,8 +383,6 @@ if uploaded is not None:
 
                 st.markdown(f"### {drug}")
 
-                # Индивидуальные подписи и заголовок для каждого графика
-                # Две колонки: слева настройки, справа сам график
                 col_settings, col_plot = st.columns([1, 2])
 
                 with col_settings:
