@@ -17,8 +17,8 @@ st.markdown("""
 Приложение:
 1) показывает исходные данные,  
 2) считает средние по *(Drug, Group, Concentration)*,  
-3) считает отношения **test/control_neg**,  
-4) считает **AUC по дозам методом трапеций** (wide-таблица),  
+3) считает отношения **test/control_neg** и **control_neg/control_neg (точка 0)**,  
+4) считает **AUC по дозам методом трапеций относительно baseline=1** (wide-таблица, по модулю или знаковая — на выбор),  
 5) показывает AUC-таблицу с колонкой «Кардиотоксичность» (в начале),  
 6) считает **|Z|-score AUC относительно некардиотоксичных** (полная таблица для всех препаратов),  
 7) формирует **итоговую таблицу** *(Cardiotoxic, Drug, Metabolite, AUC, |Z|)* по выбранному порогу,  
@@ -65,45 +65,99 @@ def compute_group_means(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     return grouped[ordered_cols], metabolite_cols
 
 def ratios_test_vs_zero_control(agg: pd.DataFrame, meta_cols: List[str]) -> pd.DataFrame:
-    """Для каждого Drug: test (dose!=0) / control_neg (dose=0)."""
-    base = agg[(agg["Group"] == "control_neg") & (agg["Concentration"] == 0)].copy()
-    base = base[["Drug"] + meta_cols].rename(columns={c: f"__base__{c}" for c in meta_cols})
+    """
+    Для каждого Drug:
+      - baseline: control_neg/control_neg (строка при Concentration=0, все метаболиты=1)
+      - test(dose!=0)/control_neg(0)
+    Вывод — в логичном порядке: для каждого препарата сначала baseline=0, затем его test-дозы.
+    """
+    result_rows = []
 
-    test = agg[(agg["Group"] == "test") & (agg["Concentration"] != 0)].copy()
-    merged = test.merge(base, on="Drug", how="left")
+    for drug, sub in agg.groupby("Drug", sort=False):
+        base = sub[(sub["Group"] == "control_neg") & (sub["Concentration"] == 0)].copy()
+        if base.empty:
+            continue
 
-    for c in meta_cols:
-        denom = merged[f"__base__{c}"].replace({0: pd.NA})
-        merged[c] = merged[c] / denom
-        merged[c] = merged[c].astype(float)
+        # baseline строка (все = 1)
+        baseline = {"Drug": drug, "Group": "control_neg", "Concentration": 0.0}
+        for c in meta_cols:
+            baseline[c] = 1.0
+        result_rows.append(baseline)
 
-    merged = merged.drop(columns=[f"__base__{c}" for c in meta_cols])
-    merged["Group"] = "test"
-    return merged[["Drug", "Group", "Concentration"] + meta_cols]
+        # test строки (dose != 0)
+        test = sub[(sub["Group"] == "test") & (sub["Concentration"] != 0)].copy()
+        for _, row in test.iterrows():
+            row_out = {"Drug": drug, "Group": "test", "Concentration": row["Concentration"]}
+            for c in meta_cols:
+                denom = base[c].iloc[0]
+                row_out[c] = row[c] / denom if pd.notna(denom) and denom != 0 else np.nan
+            result_rows.append(row_out)
 
-def trapz_auc(x: np.ndarray, y: np.ndarray) -> float:
-    """AUC трапеций: сортируем по x, убираем NaN/inf и дубли доз."""
+    return pd.DataFrame(result_rows, columns=["Drug", "Group", "Concentration"] + meta_cols)
+
+def auc_relative_to_baseline(x: np.ndarray, y: np.ndarray, baseline: float = 1.0, use_abs: bool = True) -> float:
+    """
+    AUC относительно baseline.
+    Если use_abs=True — считаем по модулю (всё >= 0).
+    Если use_abs=False — знаковая площадь (выше baseline полож., ниже — отрицат.).
+    Корректно обрабатывает пересечения с baseline (линейная интерполяция).
+    """
     mask = np.isfinite(x) & np.isfinite(y)
     x, y = x[mask], y[mask]
     if x.size < 2:
         return np.nan
+
     idx = np.argsort(x, kind="stable")
     x, y = x[idx], y[idx]
+
+    # удаляем дубли по x
     _, unique_idx = np.unique(x, return_index=True)
     x, y = x[unique_idx], y[unique_idx]
     if x.size < 2:
         return np.nan
-    return float(np.trapz(y, x))
 
-def compute_auc_wide(df_ratio: pd.DataFrame, meta_cols: List[str]) -> pd.DataFrame:
-    """Wide AUC: строка = Drug, колонки = метаболиты (в исходном порядке)."""
+    total = 0.0
+    b = float(baseline)
+
+    for i in range(len(x) - 1):
+        x1, x2 = float(x[i]), float(x[i+1])
+        y1, y2 = float(y[i]), float(y[i+1])
+        d1, d2 = y1 - b, y2 - b
+        dx = x2 - x1
+        if not np.isfinite(d1) or not np.isfinite(d2) or dx <= 0:
+            continue
+
+        same_side = (d1 >= 0 and d2 >= 0) or (d1 <= 0 and d2 <= 0)
+        if same_side:
+            a1, a2 = (abs(d1), abs(d2)) if use_abs else (d1, d2)
+            total += 0.5 * (a1 + a2) * dx
+        else:
+            # пересечение baseline: точка по линейной интерполяции
+            t = abs(d1) / (abs(d1) + abs(d2))  # доля от x1 до пересечения
+            x_cross = x1 + t * dx
+            dx1, dx2 = x_cross - x1, x2 - x_cross
+            if use_abs:
+                area1 = 0.5 * (abs(d1) + 0.0) * dx1
+                area2 = 0.5 * (0.0 + abs(d2)) * dx2
+            else:
+                area1 = 0.5 * (d1 + 0.0) * dx1
+                area2 = 0.5 * (0.0 + d2) * dx2
+            total += area1 + area2
+
+    return float(total)
+
+def compute_auc_wide(df_ratio: pd.DataFrame, meta_cols: List[str], use_abs: bool) -> pd.DataFrame:
+    """
+    Wide AUC: строка = Drug, колонки = метаболиты (в исходном порядке).
+    Используется AUC относительно baseline=1 (по модулю или знаковая — в зависимости от use_abs).
+    """
     rows = []
     for drug, sub in df_ratio.groupby("Drug", sort=False):
         x = sub["Concentration"].to_numpy(dtype=float)
         auc_row = {"Drug": drug}
         for m in meta_cols:
             y = sub[m].to_numpy(dtype=float)
-            auc_row[m] = trapz_auc(x, y)
+            auc_row[m] = auc_relative_to_baseline(x, y, baseline=1.0, use_abs=use_abs)
         rows.append(auc_row)
     auc_wide = pd.DataFrame(rows)
     return auc_wide[["Drug"] + meta_cols]
@@ -178,7 +232,7 @@ if uploaded is not None:
         )
 
         # --- Отношения ---
-        st.subheader("Отношения: test/control_neg")
+        st.subheader("Отношения: test/control_neg (и baseline 0: control_neg/control_neg)")
         df_ratio = ratios_test_vs_zero_control(df_agg, meta_cols)
         st.dataframe(df_ratio, use_container_width=True)
         st.download_button(
@@ -188,9 +242,17 @@ if uploaded is not None:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
+        # === Переключатель способа интегрирования AUC (дОЛЖЕН быть выше таблицы AUC) ===
+        use_abs_auc = st.checkbox(
+            "Считать AUC по **модулю** относительно baseline=1",
+            value=True,
+            help="Если включено — площадь выше и ниже baseline суммируется как положительная. "
+                 "Если выключено — учитывается знак (ниже baseline — отрицательная).",
+        )
+
         # --- AUC (wide) + разметка ---
-        st.subheader("AUC по метаболитам (метод трапеций) — с разметкой")
-        df_auc_wide = compute_auc_wide(df_ratio, meta_cols)
+        st.subheader("AUC по метаболитам (метод трапеций, относительно baseline=1) — с разметкой")
+        df_auc_wide = compute_auc_wide(df_ratio, meta_cols, use_abs=use_abs_auc)
 
         # состояние чекбоксов
         if "cardiotox_map" not in st.session_state:
@@ -287,7 +349,7 @@ if uploaded is not None:
             )
         else:
             st.warning("Для расчёта Z-score и итоговой таблицы отметьте **минимум 3 кардиотоксичных** препарата.")
-            z_all = None  # для логики фильтра метаболитов в графиках
+            z_all = None  # для логики метаболитов в графиках
 
         # --- Графики (в expander, matplotlib) ---
         with st.expander("Графики доза–отношение (matplotlib)", expanded=False):
@@ -307,7 +369,6 @@ if uploaded is not None:
 
             # ==== 2) Список метаболитов с учётом главного фильтра ====
             if filter_by_z:
-                # только значимые метаболиты под глобальный порог
                 sig_metas = set(sig_graph["Metabolite"].unique().tolist())
                 meta_options = [m for m in meta_cols if m in sig_metas]
                 if not meta_options:
@@ -316,7 +377,6 @@ if uploaded is not None:
             else:
                 meta_options = meta_cols
 
-            # выбор метаболита
             selected_metabolite = st.selectbox("Метаболит для графиков", meta_options, index=0)
 
             # ==== 3) Базовый список препаратов ====
@@ -354,18 +414,16 @@ if uploaded is not None:
                 st.info("По выбранным фильтрам не найдено подходящих препаратов для построения графиков.")
                 st.stop()
 
-            # выбор препаратов после всех ограничений
             selected_drugs = st.multiselect("Препараты", options=drugs_all, default=drugs_all)
 
             # ==== 5) Данные для графиков ====
             plot_df = df_ratio[df_ratio["Drug"].isin(selected_drugs)] if selected_drugs else df_ratio.iloc[0:0]
 
-            # если включён главный фильтр по Z — дополнительно отсекаем пары (Drug, Metabolite), которые не значимы
+            # если включён главный фильтр по Z — оставляем только пары (Drug, selected_metabolite), проходящие порог
             if filter_by_z and not plot_df.empty:
                 allowed_pairs = set(
                     tuple(x) for x in sig_graph[["Drug", "Metabolite"]].itertuples(index=False, name=None)
                 )
-                # оставляем только строки для выбранного метаболита и тех Drug, где пара значима
                 plot_df = plot_df[
                     (plot_df["Drug"].isin(drugs_all)) &
                     (plot_df["Drug"].map(lambda d: (d, selected_metabolite) in allowed_pairs))
@@ -373,62 +431,64 @@ if uploaded is not None:
 
             if plot_df.empty:
                 st.info("По выбранным настройкам (включая порог |Z| и выбранный метаболит) совпадений не найдено.")
-                st.stop()
+            else:
+                # ==== 6) Отрисовка: слева настройки, справа график ====
+                for drug, sub in plot_df.groupby("Drug", sort=False):
+                    sub_sorted = sub.sort_values("Concentration")
+                    x = sub_sorted["Concentration"].to_numpy(dtype=float)
+                    y = sub_sorted[selected_metabolite].to_numpy(dtype=float)
 
-            # ==== 6) Отрисовка: слева настройки, справа график ====
-            for drug, sub in plot_df.groupby("Drug", sort=False):
-                sub_sorted = sub.sort_values("Concentration")
-                x = sub_sorted["Concentration"].to_numpy(dtype=float)
-                y = sub_sorted[selected_metabolite].to_numpy(dtype=float)
+                    st.markdown(f"### {drug}")
 
-                st.markdown(f"### {drug}")
+                    col_settings, col_plot = st.columns([1, 2])
 
-                col_settings, col_plot = st.columns([1, 2])
+                    with col_settings:
+                        xlabel = st.text_input(
+                            f"Подпись оси X — {drug}",
+                            value="Concentration",
+                            help="Эта подпись применяется для всех графиков данного препарата.",
+                            key=f"xlabel_{drug}"
+                        )
+                        ylabel = st.text_input(
+                            f"Подпись оси Y — {selected_metabolite} ({drug})",
+                            value=selected_metabolite,
+                            help="Эта подпись относится только к текущему метаболиту в группе выбранного препарата.",
+                            key=f"ylabel_{drug}_{selected_metabolite}"
+                        )
+                        default_title = f"{selected_metabolite} — {drug}"
+                        title_text = st.text_input(
+                            "Заголовок графика",
+                            value=default_title,
+                            key=f"title_{drug}_{selected_metabolite}"
+                        )
 
-                with col_settings:
-                    xlabel = st.text_input(
-                        f"Подпись оси X — {drug}",
-                        value="Concentration",
-                        help="Эта подпись применяется для всех графиков данного препарата.",
-                        key=f"xlabel_{drug}"
-                    )
-                    ylabel = st.text_input(
-                        f"Подпись оси Y — {selected_metabolite} ({drug})",
-                        value=selected_metabolite,
-                        help="Эта подпись относится только к текущему метаболиту в группе выбранного препарата.",
-                        key=f"ylabel_{drug}_{selected_metabolite}"
-                    )
-                    default_title = f"{selected_metabolite} — {drug}"
-                    title_text = st.text_input(
-                        "Заголовок графика",
-                        value=default_title,
-                        key=f"title_{drug}_{selected_metabolite}"
-                    )
+                    with col_plot:
+                        fig, ax = plt.subplots(figsize=(7, 4))
+                        ax.plot(x, y, marker="o")
+                        if fill_area:
+                            ax.fill_between(x, y, 1.0, alpha=0.2)  # закраска к baseline=1
 
-                with col_plot:
-                    fig, ax = plt.subplots(figsize=(7, 4))
-                    ax.plot(x, y, marker="o")
-                    if fill_area:
-                        ax.fill_between(x, y, 0, alpha=0.2)
+                        # горизонтальная линия y=1 (baseline)
+                        ax.axhline(1.0, linestyle="--", linewidth=1, alpha=0.8)
 
-                    ax.set_xlabel(xlabel)
-                    ax.set_ylabel(ylabel)
-                    ax.set_title(title_text)
-                    # сетку не показываем
+                        ax.set_xlabel(xlabel)
+                        ax.set_ylabel(ylabel)
+                        ax.set_title(title_text)
+                        # сетку не показываем
 
-                    st.pyplot(fig, use_container_width=True)
+                        st.pyplot(fig, use_container_width=True)
 
-                    buf = io.BytesIO()
-                    fig.savefig(buf, format="png", dpi=600, bbox_inches="tight")
-                    buf.seek(0)
-                    st.download_button(
-                        label="Скачать график (PNG, 600 dpi)",
-                        data=buf.getvalue(),
-                        file_name=f"{drug}_{selected_metabolite}.png",
-                        mime="image/png",
-                        key=f"download_{drug}_{selected_metabolite}"
-                    )
-                    plt.close(fig)
+                        buf = io.BytesIO()
+                        fig.savefig(buf, format="png", dpi=600, bbox_inches="tight")
+                        buf.seek(0)
+                        st.download_button(
+                            label="Скачать график (PNG, 600 dpi)",
+                            data=buf.getvalue(),
+                            file_name=f"{drug}_{selected_metabolite}.png",
+                            mime="image/png",
+                            key=f"download_{drug}_{selected_metabolite}"
+                        )
+                        plt.close(fig)
 
     except Exception as ex:
         st.error(f"Ошибка при чтении файла: {ex}")
